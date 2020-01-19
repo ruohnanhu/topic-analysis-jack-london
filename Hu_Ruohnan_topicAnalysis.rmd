@@ -1,0 +1,232 @@
+---
+title: "Hu_Ruohnan_topicAnalysis"
+author: "Ruohnan Hu"
+date: "1/17/2020"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r warning=FALSE}
+library(tidyverse)
+library(knitr)
+opts_chunk$set(message = FALSE, warning = FALSE, cache = TRUE)
+options(width = 100, dplyr.width = 150)
+library(ggplot2)
+library(methods)
+library(scales)
+theme_set(theme_light())
+library(tidytext)
+library(gutenbergr)
+library(topicmodels)
+```
+
+
+
+```{r warning=FALSE}
+books <- gutenberg_works(author == "London, Jack") %>%
+      gutenberg_download(meta_fields = "title")
+titles <- unique(books$title)
+```
+
+```{r}
+library(stringr)
+# divide into documents, each representing one chapter
+reg <- regex("^chapter ", ignore_case = TRUE) 
+by_chapter <- books %>%
+      group_by(title) %>%
+      mutate(chapter = cumsum(str_detect(text, reg))) %>%
+      ungroup() %>%
+      filter(chapter > 0) %>%
+      unite(document, title, chapter)
+
+# split into words
+by_chapter_word <- by_chapter %>%
+      unnest_tokens(word, text)
+# find document-word counts
+word_counts <- by_chapter_word %>% 
+  anti_join(stop_words) %>% 
+  count(document, word, sort = TRUE) %>% 
+  ungroup()
+word_counts
+```
+
+LDA on Chapters
+```{r}
+chapters_dtm <- word_counts %>%
+      cast_dtm(document, word, n)
+chapters_dtm
+```
+
+
+```{r}
+chapters_lda <- LDA(chapters_dtm, k = 4, control = list(seed = 2644))
+chapters_lda
+```
+
+
+
+```{r}
+chapter_topics <- tidy(chapters_lda, matrix = "beta")
+chapter_topics
+```
+
+
+We could use dplyr’s top_n() to find the top five terms within each topic.
+```{r}
+top_terms <- chapter_topics %>%
+      group_by(topic) %>%
+      top_n(5, beta) %>%
+      ungroup() %>%
+      arrange(topic, -beta)
+top_terms
+```
+
+ggplot2 visualization
+```{r}
+library(ggplot2)
+top_terms %>%
+    mutate(term = reorder(term, beta)) %>% 
+    ggplot(aes(term, beta, fill = factor(topic))) + 
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free") + 
+    coord_flip()
+```
+
+Per-Document Classification
+```{r}
+chapters_gamma <- tidy(chapters_lda, matrix = "gamma")
+chapters_gamma
+```
+
+Now that we have these topic probabilities, we can see how well our unsupervised learning did at distinguishing the books. We’d expect that chapters within a book would be found to be mostly (or entirely) generated from the corresponding topic.
+First we re-separate the document name into title and chapter, after which we can vis‐ ualize the per-document-per-topic probability for each.
+
+```{r}
+chapters_gamma <- chapters_gamma %>%
+    separate(document, c("title", "chapter"), sep = "_", convert = TRUE)
+chapters_gamma
+```
+
+
+```{r}
+chapters_gamma %>%
+  mutate(title = reorder(title, gamma * topic)) %>%
+  ggplot(aes(factor(topic), gamma)) +
+  geom_boxplot() +
+  facet_wrap(~ title)
+```
+
+
+```{r}
+chapter_classifications <- chapters_gamma %>%
+      group_by(title, chapter) %>%
+      top_n(1, gamma) %>%
+      ungroup()
+chapter_classifications
+```
+
+
+
+```{r}
+book_topics <- chapter_classifications %>%
+      count(title, topic) %>%
+      group_by(title) %>%
+      top_n(1, n) %>%
+      ungroup() %>%
+      transmute(consensus = title, topic)
+
+chapter_classifications %>%
+      inner_join(book_topics, by = "topic") %>%
+      filter(title != consensus)
+```
+
+By-Word Assignments: augment
+We may want to take the original document-word pairs and find which words in each document were assigned to which topic. This is the job of the augment() function, which also originated in the broom package as a way of tidying model output. While
+tidy() retrieves the statistical components of the model, augment() uses a model to add information to each observation in the original data.
+```{r}
+assignments <- augment(chapters_lda, data = chapters_dtm)
+assignments
+
+```
+
+This returns a tidy data frame of book-term counts, but adds an extra col‐ umn, .topic, with the topic each term was assigned to within each document. (Extra columns added by augment always start with . to prevent overwriting existing col‐ umns.) We can combine this assignments table with the consensus book titles to find which words were incorrectly classified.
+```{r}
+assignments <- assignments %>%
+    separate(document, c("title", "chapter"), sep = "_", convert = TRUE) %>%      inner_join(book_topics, by = c(".topic" = "topic"))
+
+assignments
+```
+
+This combination of the true book (title) and the book assigned to it (consensus) is useful for further exploration. We can, for example, visualize a confusion matrix, showing how often words from one book were assigned to another, using dplyr’s count() and ggplot2’s geom_tile
+```{r}
+
+assignments %>%
+      count(title, consensus, wt = count) %>%
+      group_by(title) %>%
+      mutate(percent = n / sum(n)) %>%
+      ggplot(aes(str_wrap(consensus, width = 30), str_wrap(title, width = 50), fill = percent)) +
+      geom_tile() +
+      scale_fill_gradient2(high = "red", label = percent_format()) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, size=5),
+      panel.grid = element_blank(),
+      axis.text.y = element_text(size=5)) +
+      labs(x = "Book words were assigned to",
+           y = "Book words came from",
+           fill = "% of assignments")
+```
+
+What were the most commonly mistaken words?
+
+```{r}
+wrong_words <- assignments %>%
+      filter(title != consensus)
+wrong_words
+```
+
+
+```{r}
+wrong_words %>%
+  count(title, consensus, term, wt = count) %>%
+  ungroup() %>%
+  arrange(desc(n))
+```
+
+
+```{r}
+word_counts %>%
+      filter(word == "pilate")
+```
+
+Alternative LDA Implementations
+```{r eval=FALSE}
+# library(mallet)
+# # create a vector with one string per chapter
+#     collapsed <- by_chapter_word %>%
+#       anti_join(stop_words, by = "word") %>%
+#       mutate(word = str_replace(word, "'", "")) %>%
+#       group_by(document) %>%
+#       summarize(text = paste(word, collapse = " "))
+#     # create an empty file of "stop words"
+#     file.create(empty_file <- tempfile())
+#     docs <- mallet.import(collapsed$document, collapsed$text, empty_file)
+#     mallet_model <- MalletLDA(num.topics = 4)
+#     mallet_model$loadDocuments(docs)
+#     mallet_model$train(100)
+```
+
+
+```{r eval=FALSE}
+# # word-topic pairs
+# tidy(mallet_model)
+# # document-topic pairs
+#     tidy(mallet_model, matrix = "gamma")
+#     # column needs to be named "term" for "augment"
+#     term_counts <- rename(word_counts, term = word)
+#     augment(mallet_model, term_counts)
+```
+
+
+
+
